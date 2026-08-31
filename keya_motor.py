@@ -357,28 +357,49 @@ class KeyaMotorController:
             desc = self._describe_tx(command)
             print(f"  TX  {command:<22}  {desc}")
 
-        # The controller echoes the command before sending the actual response.
-        # Read lines until we get something that isn't our own echo.
-        for _ in range(4):
+        # The controller echoes the command, then sends the real reply.  Motor
+        # noise can also inject corrupted bytes.  A *real* reply is exactly '+',
+        # exactly '-', or contains '=' (KEY=value).  Anything else (the echo or
+        # a garbled noise byte) is skipped so transient corruption can't raise.
+        for _ in range(8):
             raw = self._serial.read_until(b'\r')
             response = raw.decode('ascii', errors='replace').strip()
 
+            is_real = response in ('+', '-') or '=' in response
+
             if self.debug:
-                if response.upper() == command.upper():
-                    print(f"  RX  {response:<22}  [echo]")
+                if not response:
+                    pass  # timeout / empty read
+                elif not is_real:
+                    print(f"  RX  {response:<22}  [echo/noise — skipped]")
                 else:
                     desc = self._describe_rx(response, command)
                     print(f"  RX  {response:<22}  {desc}")
 
-            if response.upper() == command.upper():
-                continue  # echo — read the real response
+            if not is_real:
+                continue  # echo or noise — keep reading for the real reply
 
             if response == '-':
                 raise KeyaError(f"Controller rejected command: {command!r}")
 
             return response
 
-        raise KeyaError(f"No response after echo for command: {command!r}")
+        raise KeyaError(f"No valid response for command: {command!r}")
+
+    def _send_fast(self, command: str) -> None:
+        """
+        Fire-and-forget send for high-frequency commands (e.g. live speed).
+
+        Writes the command but does NOT wait for or parse the reply, so RS232
+        noise can never raise an error here.  The stale echo/ack left in the
+        receive buffer is flushed by the next call's reset_input_buffer().
+        """
+        if not self.is_connected:
+            raise KeyaError("Not connected — call connect() first.")
+        self._serial.reset_input_buffer()
+        self._serial.write((command + '\r').encode('ascii'))
+        if self.debug:
+            print(f"  TX  {command:<22}  {self._describe_tx(command)} [fast]")
 
     def _write(self, command: str) -> None:
         """Send a write/action command and verify the '+' acknowledgment."""
@@ -405,6 +426,7 @@ class KeyaMotorController:
         self,
         channel1: int,
         channel2: Optional[int] = None,
+        verify: bool = True,
     ) -> None:
         """
         Set motor speed.
@@ -414,6 +436,9 @@ class KeyaMotorController:
                       Positive = forward, negative = reverse.
             channel2: Speed for channel 2 (dual-channel controllers only).
                       Omit for single-channel controllers.
+            verify:   When True (default), wait for and check the '+' ack.
+                      When False, fire-and-forget — does not read the reply, so
+                      RS232 noise can't raise.  Use for high-rate live control.
 
         Raises:
             ValueError: Speed out of -1000..+1000 range.
@@ -427,9 +452,14 @@ class KeyaMotorController:
         if channel2 is not None:
             if not -1000 <= channel2 <= 1000:
                 raise ValueError(f"channel2 speed {channel2} out of range -1000..1000")
-            self._write(f'!M {channel1} {channel2}')
+            cmd = f'!M {channel1} {channel2}'
         else:
-            self._write(f'!M {channel1}')
+            cmd = f'!M {channel1}'
+
+        if verify:
+            self._write(cmd)
+        else:
+            self._send_fast(cmd)
 
     def stop(self, channel: Optional[int] = None) -> None:
         """
