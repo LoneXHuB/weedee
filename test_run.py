@@ -1,12 +1,17 @@
-"""Simple motor test — releases brake via digital output then runs at low speed."""
+"""Simple motor test — releases e-stop then runs at low speed.
 
+Usage: python3 test_run.py [port]   (default /dev/ttyUSB0; use 'can0' for CAN bus)
+"""
+
+import sys
 import time
-from keya_motor import KeyaMotorController, KeyaError
+from keya_motor import KeyaMotorController, KeyaError, KeyaUnsupportedError
 
-PORT = '/dev/ttyUSB0'
+PORT = sys.argv[1] if len(sys.argv) > 1 else '/dev/ttyUSB0'
 SPEED = 200        # -1000 to +1000
 DURATION = 5.0     # seconds
 with KeyaMotorController(PORT, debug=False) as motor:
+    print(f"Protocol: {motor.protocol}")
     motor.release_emergency_stop()
     time.sleep(0.2)
 
@@ -32,7 +37,10 @@ with KeyaMotorController(PORT, debug=False) as motor:
 
         try:
             m = motor.read_motor_command()
-            p = motor.read_motor_power()
+            try:
+                p = motor.read_motor_power()
+            except KeyaUnsupportedError:    # not available on every protocol
+                p = 0
             a = motor.read_motor_amps()
             print(f"{m:>+8d}  {p:>+8d}  {a:>7.1f} A")
         except KeyaError:
