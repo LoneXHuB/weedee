@@ -1,24 +1,33 @@
 """
-keya_motor.py — Python library for Keya motor controllers via RS232.
+keya_motor.py — Python library for Keya motor controllers (RS232 or CAN bus).
 
-Serial settings: 115200 baud, 8-N-1.
-Commands are ASCII, terminated with carriage return (\\r).
-Acknowledgment: '+' for write commands, response string for queries, '-' on error.
+The wire protocol is hidden: the same API works over RS232 (ASCII) and over
+CAN (CANopen SDO).  The protocol is picked from the port name, or explicitly.
+
+All speed/power values use the controller's native scale: -1000 (full
+reverse) to +1000 (full forward).
 
 Typical usage:
     from keya_motor import KeyaMotorController
 
-    with KeyaMotorController('/dev/ttyUSB0') as motor:
+    with KeyaMotorController('/dev/ttyUSB0') as motor:     # RS232
+    # with KeyaMotorController('can0', node_id=1) as motor:  # CAN
         motor.release_emergency_stop()
         motor.set_speed(200)        # 20% forward
         time.sleep(3)
         motor.stop()
+
+Features missing on a given protocol (e.g. digital outputs over CAN) raise
+:class:`KeyaUnsupportedError`, a subclass of :class:`KeyaError`.
 """
 
-import time
-import serial
 from dataclasses import dataclass
-from typing import Optional, Union
+from typing import List, Optional, Union
+
+from keya_transport import KeyaError, KeyaUnsupportedError, Transport
+
+__all__ = ['KeyaMotorController', 'KeyaError', 'KeyaUnsupportedError',
+           'Voltages', 'Temperatures', 'FaultFlags', 'StatusFlags']
 
 
 # ---------------------------------------------------------------------------
@@ -75,12 +84,6 @@ class StatusFlags:
     micro_basic_running: bool
 
 
-# ---------------------------------------------------------------------------
-# Exceptions
-# ---------------------------------------------------------------------------
-
-class KeyaError(Exception):
-    """Raised when the controller rejects a command or the connection fails."""
 
 
 # ---------------------------------------------------------------------------
@@ -89,16 +92,20 @@ class KeyaError(Exception):
 
 class KeyaMotorController:
     """
-    Interface to a Keya brushed/brushless motor controller over RS232.
+    Interface to a Keya brushed/brushless motor controller.
 
-    Supports single- and dual-channel controllers.  All speed/power values
-    use the controller's native scale: -1000 (full reverse) to +1000 (full
-    forward), where ±1000 equals 100 % duty cycle.
+    Supports single- and dual-channel controllers over RS232 or CAN.
 
     Args:
-        port:    Serial device path, e.g. '/dev/ttyUSB0' or 'COM3'.
-        timeout: Per-read timeout in seconds (default 1.0).
-        debug:   Print every TX/RX line to stdout when True (default False).
+        port:     Serial device path ('/dev/ttyUSB0', 'COM3') or CAN channel
+                  ('can0').
+        timeout:  Per-read timeout in seconds (default 1.0).
+        debug:    Print every TX/RX exchange to stdout when True.
+        protocol: 'auto' (default: 'can*'/'vcan*'/'slcan*' ports use CAN,
+                  everything else RS232), 'serial' or 'can'.
+        node_id:  CAN node ID of the controller, 1..126 (CAN only, default 1).
+        **can_options: extra CAN settings (CAN only): ``bustype``
+                  (default 'socketcan'), ``bitrate``.
 
     Examples:
         # Context-manager (recommended) — auto connect/disconnect:
@@ -107,41 +114,55 @@ class KeyaMotorController:
             time.sleep(2)
             m.stop()
 
-        # Manual connect/disconnect:
-        m = KeyaMotorController('/dev/ttyUSB0')
-        m.connect()
-        m.set_speed(300)
-        m.disconnect()
+        # Same API over CAN:
+        with KeyaMotorController('can0', node_id=1) as m:
+            m.set_speed(300)
+            print(m.protocol)   # 'can'
     """
 
-    BAUD_RATE = 115200
+    _CAN_PREFIXES = ('can', 'vcan', 'slcan')
 
-    def __init__(self, port: str = '/dev/ttyUSB0', timeout: float = 1.0, debug: bool = False):
+    def __init__(
+        self,
+        port: str = '/dev/ttyUSB0',
+        timeout: float = 1.0,
+        debug: bool = False,
+        protocol: str = 'auto',
+        node_id: int = 1,
+        **can_options,
+    ):
+        if protocol == 'auto':
+            protocol = 'can' if port.lower().startswith(self._CAN_PREFIXES) else 'serial'
         self.port = port
         self.timeout = timeout
-        self.debug = debug          # print TX/RX lines when True
-        self._serial: Optional[serial.Serial] = None
+        self.debug = debug
+        self._transport = self._make_transport(protocol, node_id, can_options)  # type: Transport
+
+    def _make_transport(self, protocol: str, node_id: int, can_options: dict) -> Transport:
+        if protocol == 'serial':
+            from keya_serial import SerialTransport
+            return SerialTransport(self.port, self.timeout, self.debug)
+        if protocol == 'can':
+            from keya_can import CanTransport
+            return CanTransport(self.port, node_id, self.timeout, self.debug, **can_options)
+        raise ValueError(f"Unknown protocol {protocol!r} (use 'auto', 'serial' or 'can')")
+
+    @property
+    def protocol(self) -> str:
+        """Active wire protocol: 'serial' or 'can'."""
+        return self._transport.name
 
     # ------------------------------------------------------------------
     # Connection management
     # ------------------------------------------------------------------
 
     def connect(self) -> None:
-        """Open the serial port and prepare the connection."""
-        self._serial = serial.Serial(
-            port=self.port,
-            baudrate=self.BAUD_RATE,
-            bytesize=serial.EIGHTBITS,
-            stopbits=serial.STOPBITS_ONE,
-            parity=serial.PARITY_NONE,
-            timeout=self.timeout,
-        )
-        time.sleep(0.05)  # brief settle after open
+        """Open the serial port / CAN channel."""
+        self._transport.open()
 
     def disconnect(self) -> None:
-        """Close the serial port."""
-        if self._serial and self._serial.is_open:
-            self._serial.close()
+        """Close the serial port / CAN channel."""
+        self._transport.close()
 
     def __enter__(self):
         self.connect()
@@ -152,250 +173,28 @@ class KeyaMotorController:
 
     @property
     def is_connected(self) -> bool:
-        """True if the serial port is open."""
-        return bool(self._serial and self._serial.is_open)
+        """True if the link is open."""
+        return self._transport.is_open
 
     # ------------------------------------------------------------------
-    # Low-level send / receive
+    # Protocol-neutral helpers
     # ------------------------------------------------------------------
 
-    # ------------------------------------------------------------------
-    # Debug helpers
-    # ------------------------------------------------------------------
+    def _write(self, cmd: str, *args: int) -> None:
+        self._transport.write(cmd, *args)
 
-    @staticmethod
-    def _describe_tx(cmd: str) -> str:
-        """Return a short human-readable description of an outgoing command."""
-        p = cmd.split()
-        u = cmd.upper().strip()
+    def _query(self, cmd: str, *args: int) -> List[int]:
+        return self._transport.query(cmd, *args)
 
-        # --- motor control ---
-        if u == '!MG':
-            return 'Release emergency stop'
-        if u == '!EX':
-            return 'Emergency stop'
-        if u.startswith('!MS'):
-            ch = p[1] if len(p) > 1 else 'all'
-            return f'Stop channel {ch}'
-        if u.startswith('!M '):
-            desc = f'Set motor speed: ch1={int(p[1]):+d} ({abs(int(p[1]))/10:.0f}%)'
-            if len(p) > 2:
-                desc += f'  ch2={int(p[2]):+d} ({abs(int(p[2]))/10:.0f}%)'
-            return desc
-        if u.startswith('!P '):
-            return f'Go to absolute position: ch={p[1]}  target={p[2]} counts'
-        # --- config ---
-        if u.startswith('^MAC'):
-            return f'Set acceleration: ch={p[1]}  {p[2]} × 0.1 RPM/s'
-        if u.startswith('^MDEC'):
-            return f'Set deceleration: ch={p[1]}  {p[2]} × 0.1 RPM/s'
-        if u.startswith('^MVEL'):
-            return f'Set position velocity: ch={p[1]}  {p[2]} RPM'
-        if u == '%EESAV':
-            return 'Save configuration to EEPROM'
-        # --- digital I/O ---
-        if u.startswith('!D0'):
-            return f'Turn OFF digital output {p[1]}'
-        if u.startswith('!D1'):
-            return f'Turn ON  digital output {p[1]}'
-        if u.startswith('!DS'):
-            return f'Set all digital outputs: bitmask={p[1]} (binary {int(p[1]):08b})'
-        # --- queries ---
-        _queries = {
-            '?V':   'Read voltages (internal / battery / 5 V)',
-            '?FF':  'Read fault flags',
-            '?FS':  'Read status flags',
-            '?LK':  'Read lock status',
-            '?E':   'Read closed-loop error',
-            '?DO':  'Read digital output states',
-            '?BS':  'Read brushless motor speed (Hall sensors)',
-            '?CIA': 'Read internal analog command value',
-            '?CIP': 'Read internal pulse command value',
-            '?CIS': 'Read internal serial command value',
-        }
-        base = u.split()[0]
-        if base in _queries:
-            return _queries[base]
-        if base == '?A':
-            ch = f' ch{p[1]}' if len(p) > 1 else ''
-            return f'Read motor amps{ch}'
-        if base == '?AIC':
-            return 'Read analog input after conversion (±1000 scale)'
-        if base == '?AI':
-            ch = f' ch{p[1]}' if len(p) > 1 else ''
-            return f'Read analog input{ch} (raw mV)'
-        if base == '?BA':
-            ch = f' ch{p[1]}' if len(p) > 1 else ''
-            return f'Read battery amps{ch}'
-        if base == '?C':
-            ch = f' ch{p[1]}' if len(p) > 1 else ''
-            return f'Read encoder position{ch} (counts)'
-        if base == '?DI':
-            ch = f' {p[1]}' if len(p) > 1 else ''
-            return f'Read digital input{ch}'
-        if base == '?D':
-            return 'Read all digital inputs (bitmask)'
-        if base == '?F':
-            ch = f' ch{p[1]}' if len(p) > 1 else ''
-            return f'Read feedback{ch}'
-        if base == '?M':
-            ch = f' ch{p[1]}' if len(p) > 1 else ''
-            return f'Read applied motor command{ch} (±1000)'
-        if base == '?P':
-            ch = f' ch{p[1]}' if len(p) > 1 else ''
-            return f'Read applied power level{ch} (±1000)'
-        if base == '?PIC':
-            return 'Read pulse input after conversion (±1000 scale)'
-        if base == '?PI':
-            ch = f' ch{p[1]}' if len(p) > 1 else ''
-            return f'Read pulse input{ch} (µs)'
-        if base == '?S':
-            ch = f' ch{p[1]}' if len(p) > 1 else ''
-            return f'Read encoder speed{ch} (RPM)'
-        if base == '?T':
-            ch = f' ch{p[1]}' if len(p) > 1 else ''
-            return f'Read temperatures{ch} (°C)'
-        return ''
+    def _scalar(self, cmd: str, *args: int) -> int:
+        return self._query(cmd, *args)[0]
 
-    @staticmethod
-    def _describe_rx(resp: str, sent_cmd: str) -> str:
-        """Return a short human-readable description of an incoming response."""
-        if resp == '+':
-            return 'OK — acknowledged'
-        if resp == '-':
-            return 'ERROR — command not recognised'
-
-        key = resp.split('=')[0].upper() if '=' in resp else ''
-        val = resp.split('=', 1)[1] if '=' in resp else ''
-
-        if key == 'V':
-            parts = val.split(':')
-            if len(parts) == 3:
-                return (f'internal={int(parts[0])/10:.1f} V  '
-                        f'battery={int(parts[1])/10:.1f} V  '
-                        f'5Vout={int(parts[2])/1000:.3f} V')
-        if key == 'FF':
-            bits = int(val)
-            if bits == 0:
-                return 'no faults active'
-            names = ['overheat', 'overvoltage', 'undervoltage', 'short-circuit',
-                     'e-stop', 'sepex-fault', 'MOSFET-fail', 'startup-fault']
-            active = [names[i] for i in range(8) if bits & (1 << i)]
-            return 'FAULT: ' + ', '.join(active)
-        if key == 'FS':
-            bits = int(val)
-            names = ['serial', 'pulse', 'analog', 'pwr-stage-off',
-                     'stall', 'at-limit', '(unused)', 'uBasic-running']
-            active = [names[i] for i in range(8) if bits & (1 << i)]
-            return 'active: ' + (', '.join(active) if active else 'none')
-        if key == 'A':
-            parts = val.split(':')
-            return '  '.join(f'ch{i+1}={int(v)/10:.1f} A' for i, v in enumerate(parts))
-        if key == 'BA':
-            parts = val.split(':')
-            return '  '.join(f'ch{i+1}={int(v)/10:.1f} A (battery)' for i, v in enumerate(parts))
-        if key == 'M':
-            parts = val.split(':')
-            return '  '.join(f'ch{i+1}={int(v):+d}/1000 ({abs(int(v))/10:.0f}%)' for i, v in enumerate(parts))
-        if key == 'P':
-            parts = val.split(':')
-            return '  '.join(f'ch{i+1}={int(v):+d}/1000 power' for i, v in enumerate(parts))
-        if key == 'S':
-            parts = val.split(':')
-            return '  '.join(f'ch{i+1}={v} RPM' for i, v in enumerate(parts))
-        if key == 'BS':
-            return f'{val} RPM (Hall sensor)'
-        if key == 'T':
-            parts = val.split(':')
-            labels = ['IC', 'ch1-heatsink', 'ch2-heatsink']
-            return '  '.join(f'{labels[i]}={v} °C' for i, v in enumerate(parts) if i < len(labels))
-        if key == 'C':
-            return f'encoder count = {val}'
-        if key == 'E':
-            return f'closed-loop error = {val}'
-        if key == 'F':
-            return f'feedback = {val}'
-        if key == 'LK':
-            return 'locked' if val == '1' else 'unlocked'
-        if key == 'AI':
-            return f'{val} mV (raw)'
-        if key == 'AIC':
-            return f'converted = {val} (±1000 scale)'
-        if key in ('CIA', 'CIP', 'CIS'):
-            src = {'CIA': 'analog', 'CIP': 'pulse', 'CIS': 'serial'}[key]
-            return f'{src} command = {val} (±1000)'
-        if key == 'DI':
-            return f'state = {val}  (1=active 0=inactive)'
-        if key == 'DO':
-            return f'outputs bitmask = {val}  (binary {int(val):08b})'
-        if key == 'D':
-            return f'all inputs bitmask = {val}'
-        if key == 'PI':
-            return f'{val} µs (raw pulse width)'
-        if key == 'PIC':
-            return f'converted = {val} (±1000 scale)'
-        return ''
-
-    # ------------------------------------------------------------------
-    # Low-level send / receive
-    # ------------------------------------------------------------------
-
-    def _send(self, command: str) -> str:
-        """
-        Send *command* (no trailing \\r needed) and return the stripped response.
-
-        Raises:
-            KeyaError: If not connected or the controller replies with '-'.
-        """
-        if not self.is_connected:
-            raise KeyaError("Not connected — call connect() first.")
-
-        self._serial.reset_input_buffer()
-        self._serial.write((command + '\r').encode('ascii'))
-
-        if self.debug:
-            desc = self._describe_tx(command)
-            print(f"  TX  {command:<22}  {desc}")
-
-        # The controller echoes the command before sending the actual response.
-        # Read lines until we get something that isn't our own echo.
-        for _ in range(4):
-            raw = self._serial.read_until(b'\r')
-            response = raw.decode('ascii', errors='replace').strip()
-
-            if self.debug:
-                if response.upper() == command.upper():
-                    print(f"  RX  {response:<22}  [echo]")
-                else:
-                    desc = self._describe_rx(response, command)
-                    print(f"  RX  {response:<22}  {desc}")
-
-            if response.upper() == command.upper():
-                continue  # echo — read the real response
-
-            if response == '-':
-                raise KeyaError(f"Controller rejected command: {command!r}")
-
-            return response
-
-        raise KeyaError(f"No response after echo for command: {command!r}")
-
-    def _write(self, command: str) -> None:
-        """Send a write/action command and verify the '+' acknowledgment."""
-        resp = self._send(command)
-        if resp and resp != '+':
-            raise KeyaError(
-                f"Unexpected ack for command {command!r}: {resp!r}"
-            )
-
-    def _query(self, command: str) -> str:
-        """Send a query command and return the value after '='."""
-        resp = self._send(command)
-        if '=' not in resp:
-            raise KeyaError(
-                f"Unexpected response for query {command!r}: {resp!r}"
-            )
-        return resp.split('=', 1)[1]
+    def _per_channel(self, cmd: str, channel: Optional[int], scale: float = 1):
+        """Query one value (channel given) or all channels; unwrap singletons."""
+        parts = self._query(cmd, *([channel] if channel else []))
+        if scale != 1:
+            parts = [p / scale for p in parts]
+        return parts[0] if len(parts) == 1 else parts
 
     # ------------------------------------------------------------------
     # Motor control
@@ -427,9 +226,9 @@ class KeyaMotorController:
         if channel2 is not None:
             if not -1000 <= channel2 <= 1000:
                 raise ValueError(f"channel2 speed {channel2} out of range -1000..1000")
-            self._write(f'!M {channel1} {channel2}')
+            self._write('M', channel1, channel2)
         else:
-            self._write(f'!M {channel1}')
+            self._write('M', channel1)
 
     def stop(self, channel: Optional[int] = None) -> None:
         """
@@ -439,9 +238,13 @@ class KeyaMotorController:
             channel: Channel to stop (1 or 2).  If None, stops all channels.
         """
         if channel is not None:
-            self._write(f'!MS {channel}')
-        else:
-            self.set_speed(0)
+            self._write('MS', channel)
+            return
+        try:                                  # zero every channel the controller has
+            n_channels = max(1, len(self._query('M')))
+        except KeyaUnsupportedError:
+            n_channels = 1
+        self._write('M', *([0] * n_channels))
 
     def emergency_stop(self) -> None:
         """
@@ -450,11 +253,11 @@ class KeyaMotorController:
         The controller will not accept motion commands until
         :meth:`release_emergency_stop` is called or the unit is power-cycled.
         """
-        self._write('!EX')
+        self._write('EX')
 
     def release_emergency_stop(self) -> None:
         """Release a software emergency stop and resume normal operation."""
-        self._write('!MG')
+        self._write('MG')
 
     def go_to_position(self, position: int, channel: int = 1) -> None:
         """
@@ -467,7 +270,7 @@ class KeyaMotorController:
         """
         if not -2_147_483_647 <= position <= 2_147_483_647:
             raise ValueError("Position out of ±2147483647 range")
-        self._write(f'!P {channel} {position}')
+        self._write('P', channel, position)
 
     # ------------------------------------------------------------------
     # Configuration (runtime-settable, saved with save_config())
@@ -483,7 +286,7 @@ class KeyaMotorController:
         """
         if not 100 <= rate <= 32_000:
             raise ValueError(f"Acceleration {rate} out of range 100..32000")
-        self._write(f'^MAC {channel} {rate}')
+        self._write('MAC', channel, rate)
 
     def set_deceleration(self, rate: int, channel: int = 1) -> None:
         """
@@ -495,7 +298,7 @@ class KeyaMotorController:
         """
         if not 100 <= rate <= 32_000:
             raise ValueError(f"Deceleration {rate} out of range 100..32000")
-        self._write(f'^MDEC {channel} {rate}')
+        self._write('MDEC', channel, rate)
 
     def set_position_velocity(self, rpm: int, channel: int = 1) -> None:
         """
@@ -505,7 +308,7 @@ class KeyaMotorController:
             rpm:     Target speed in RPM.
             channel: Motor channel (default 1).
         """
-        self._write(f'^MVEL {channel} {rpm}')
+        self._write('MVEL', channel, rpm)
 
     def save_config(self) -> None:
         """
@@ -514,7 +317,7 @@ class KeyaMotorController:
         Warning: Do NOT call while motors are running — the control loop
         pauses for several milliseconds during the write.
         """
-        self._write('%EESAV')
+        self._write('EESAV')
 
     # ------------------------------------------------------------------
     # Digital I/O
@@ -528,8 +331,7 @@ class KeyaMotorController:
             pin:   Output pin number (controller-specific, typically 1-based).
             state: True = ON, False = OFF.
         """
-        cmd = f'!D1 {pin}' if state else f'!D0 {pin}'
-        self._write(cmd)
+        self._write('D1' if state else 'D0', pin)
 
     def set_all_digital_outputs(self, pattern: int) -> None:
         """
@@ -541,7 +343,7 @@ class KeyaMotorController:
         """
         if not 0 <= pattern <= 255:
             raise ValueError("Bit pattern must be 0–255")
-        self._write(f'!DS {pattern}')
+        self._write('DS', pattern)
 
     def read_digital_outputs(self) -> int:
         """
@@ -550,21 +352,20 @@ class KeyaMotorController:
         Returns:
             Integer; convert to binary to inspect individual output bits.
         """
-        return int(self._query('?DO'))
+        return self._scalar('DO')
 
     def read_digital_input(self, pin: int) -> bool:
         """Read a single digital input pin. Returns True if active."""
-        return bool(int(self._query(f'?DI {pin}')))
+        return bool(self._scalar('DI', pin))
 
-    def read_all_digital_inputs(self) -> list[int]:
+    def read_all_digital_inputs(self) -> List[int]:
         """
         Read all digital inputs.
 
         Returns:
             List of 0/1 integers, one per available input channel.
         """
-        val = self._query('?DI')
-        return [int(x) for x in val.split(':')]
+        return self._query('DI')
 
     # ------------------------------------------------------------------
     # Sensor / telemetry queries
@@ -581,11 +382,11 @@ class KeyaMotorController:
             v = motor.read_voltages()
             print(f"Battery: {v.battery_v:.1f} V")
         """
-        parts = self._query('?V').split(':')
+        parts = self._query('V')
         return Voltages(
-            internal_v=int(parts[0]) / 10.0,
-            battery_v=int(parts[1]) / 10.0,
-            output_5v=int(parts[2]) / 1000.0,
+            internal_v=parts[0] / 10.0,
+            battery_v=parts[1] / 10.0,
+            output_5v=parts[2] / 1000.0,
         )
 
     def read_temperatures(self) -> Temperatures:
@@ -595,14 +396,14 @@ class KeyaMotorController:
         Returns:
             :class:`Temperatures` dataclass.
         """
-        parts = self._query('?T').split(':')
+        parts = self._query('T')
         return Temperatures(
-            internal_ic=int(parts[0]),
-            channel1_heatsink=int(parts[1]) if len(parts) > 1 else 0,
-            channel2_heatsink=int(parts[2]) if len(parts) > 2 else 0,
+            internal_ic=parts[0],
+            channel1_heatsink=parts[1] if len(parts) > 1 else 0,
+            channel2_heatsink=parts[2] if len(parts) > 2 else 0,
         )
 
-    def read_motor_amps(self, channel: Optional[int] = None) -> Union[float, list[float]]:
+    def read_motor_amps(self, channel: Optional[int] = None) -> Union[float, List[float]]:
         """
         Read motor current in Amperes.
 
@@ -612,11 +413,9 @@ class KeyaMotorController:
         Returns:
             Single float, or list of floats for multi-channel controllers.
         """
-        cmd = f'?A {channel}' if channel else '?A'
-        parts = [int(p) / 10.0 for p in self._query(cmd).split(':')]
-        return parts[0] if len(parts) == 1 else parts
+        return self._per_channel('A', channel, 10.0)
 
-    def read_battery_amps(self, channel: Optional[int] = None) -> Union[float, list[float]]:
+    def read_battery_amps(self, channel: Optional[int] = None) -> Union[float, List[float]]:
         """
         Read battery current in Amperes.
 
@@ -626,11 +425,9 @@ class KeyaMotorController:
         Returns:
             Single float, or list of floats for multi-channel controllers.
         """
-        cmd = f'?BA {channel}' if channel else '?BA'
-        parts = [int(p) / 10.0 for p in self._query(cmd).split(':')]
-        return parts[0] if len(parts) == 1 else parts
+        return self._per_channel('BA', channel, 10.0)
 
-    def read_encoder_speed(self, channel: Optional[int] = None) -> Union[int, list[int]]:
+    def read_encoder_speed(self, channel: Optional[int] = None) -> Union[int, List[int]]:
         """
         Read encoder-measured motor speed in RPM.
 
@@ -640,13 +437,11 @@ class KeyaMotorController:
         Returns:
             Speed in RPM, or list for multi-channel controllers.
         """
-        cmd = f'?S {channel}' if channel else '?S'
-        parts = [int(p) for p in self._query(cmd).split(':')]
-        return parts[0] if len(parts) == 1 else parts
+        return self._per_channel('S', channel)
 
     def read_brushless_speed(self) -> int:
         """Read brushless motor speed in RPM (Hall-sensor based)."""
-        return int(self._query('?BS'))
+        return self._scalar('BS')
 
     def read_encoder_position(self, channel: Optional[int] = None) -> int:
         """
@@ -655,21 +450,18 @@ class KeyaMotorController:
         Returns:
             32-bit signed count.  One full revolution = encoder_ppr × 4.
         """
-        cmd = f'?C {channel}' if channel else '?C'
-        return int(self._query(cmd))
+        return self._per_channel('C', channel)
 
-    def read_motor_command(self, channel: Optional[int] = None) -> Union[int, list[int]]:
+    def read_motor_command(self, channel: Optional[int] = None) -> Union[int, List[int]]:
         """
         Read the command value currently applied by the controller (-1000..+1000).
 
         Returns:
             Integer command, or list for multi-channel controllers.
         """
-        cmd = f'?M {channel}' if channel else '?M'
-        parts = [int(p) for p in self._query(cmd).split(':')]
-        return parts[0] if len(parts) == 1 else parts
+        return self._per_channel('M', channel)
 
-    def read_motor_power(self, channel: Optional[int] = None) -> Union[int, list[int]]:
+    def read_motor_power(self, channel: Optional[int] = None) -> Union[int, List[int]]:
         """
         Read actual power output applied to the motor (-1000..+1000).
 
@@ -678,11 +470,9 @@ class KeyaMotorController:
         Returns:
             Power level, or list for multi-channel controllers.
         """
-        cmd = f'?P {channel}' if channel else '?P'
-        parts = [int(p) for p in self._query(cmd).split(':')]
-        return parts[0] if len(parts) == 1 else parts
+        return self._per_channel('P', channel)
 
-    def read_analog_input(self, channel: Optional[int] = None) -> Union[int, list[int]]:
+    def read_analog_input(self, channel: Optional[int] = None) -> Union[int, List[int]]:
         """
         Read raw analog input(s) in millivolts (0–5000 mV).
 
@@ -692,9 +482,7 @@ class KeyaMotorController:
         Returns:
             Integer millivolt reading, or list for multiple channels.
         """
-        cmd = f'?AI {channel}' if channel else '?AI'
-        parts = [int(p) for p in self._query(cmd).split(':')]
-        return parts[0] if len(parts) == 1 else parts
+        return self._per_channel('AI', channel)
 
     def read_closed_loop_error(self) -> int:
         """
@@ -702,13 +490,11 @@ class KeyaMotorController:
 
         Returns 0 in open-loop mode.
         """
-        return int(self._query('?E'))
+        return self._scalar('E')
 
-    def read_feedback(self, channel: Optional[int] = None) -> Union[int, list[int]]:
+    def read_feedback(self, channel: Optional[int] = None) -> Union[int, List[int]]:
         """Read the feedback sensor value(s) used in closed-loop mode."""
-        cmd = f'?F {channel}' if channel else '?F'
-        parts = [int(p) for p in self._query(cmd).split(':')]
-        return parts[0] if len(parts) == 1 else parts
+        return self._per_channel('F', channel)
 
     def read_fault_flags(self) -> FaultFlags:
         """
@@ -722,7 +508,7 @@ class KeyaMotorController:
             if faults.any_fault():
                 print("Fault detected:", faults)
         """
-        bits = int(self._query('?FF'))
+        bits = self._scalar('FF')
         return FaultFlags(
             overheat               = bool(bits & (1 << 0)),
             overvoltage            = bool(bits & (1 << 1)),
@@ -741,7 +527,7 @@ class KeyaMotorController:
         Returns:
             :class:`StatusFlags` dataclass.
         """
-        bits = int(self._query('?FS'))
+        bits = self._scalar('FS')
         return StatusFlags(
             serial_mode      = bool(bits & (1 << 0)),
             pulse_mode       = bool(bits & (1 << 1)),
@@ -754,19 +540,38 @@ class KeyaMotorController:
 
     def is_locked(self) -> bool:
         """Return True if the controller configuration is locked."""
-        return self._query('?LK').strip() == '1'
+        return self._scalar('LK') == 1
 
     def read_internal_serial_command(self) -> int:
         """Read the command value currently issued from the serial interface (-1000..+1000)."""
-        return int(self._query('?CIS'))
+        return self._scalar('CIS')
 
-    def read_pulse_input(self, channel: Optional[int] = None) -> Union[int, list[int]]:
+    def read_internal_analog_command(self) -> int:
+        """Read the command computed from the analog inputs, applied or not (-1000..+1000)."""
+        return self._scalar('CIA')
+
+    def read_internal_pulse_command(self) -> int:
+        """Read the command computed from the pulse inputs, applied or not (-1000..+1000)."""
+        return self._scalar('CIP')
+
+    def read_analog_input_converted(self) -> int:
+        """Read the analog input after Min/Max/Center/Deadband/Linearity conversion (-1000..+1000)."""
+        return self._scalar('AIC')
+
+    def read_pulse_input_converted(self) -> int:
+        """Read the pulse input after Min/Max/Center/Deadband/Linearity conversion (-1000..+1000)."""
+        return self._scalar('PIC')
+
+    def read_digital_inputs_mask(self) -> int:
+        """Read all digital inputs as a bitmask (bit 0 = input 1)."""
+        return self._scalar('D')
+
+    def read_pulse_input(self, channel: Optional[int] = None) -> Union[int, List[int]]:
         """
-        Read raw pulse input value in microseconds (Pulse Width mode).
+        Read raw pulse input capture.
 
         Returns:
-            Microseconds (0–65 000), or list for multiple channels.
+            Microseconds (0–65 000) in Pulse Width mode, Hertz in Frequency
+            mode, 0–4095 in Duty Cycle mode; list for multiple channels.
         """
-        cmd = f'?PI {channel}' if channel else '?PI'
-        parts = [int(p) for p in self._query(cmd).split(':')]
-        return parts[0] if len(parts) == 1 else parts
+        return self._per_channel('PI', channel)

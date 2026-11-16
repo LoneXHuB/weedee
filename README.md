@@ -1,6 +1,32 @@
 # weedee
 
-Python library for Keya motor controllers via RS232 (`keya_motor.py`).
+Python library for Keya motor controllers over RS232 or CAN bus (`keya_motor.py`).
+
+The protocol is transparent: `KeyaMotorController` exposes the same API on both.
+
+```python
+KeyaMotorController('/dev/ttyUSB0')        # RS232 (auto-detected)
+KeyaMotorController('can0', node_id=1)     # CAN (port name starts with can/vcan/slcan)
+KeyaMotorController('can0', protocol='can')  # or force it
+motor.protocol                             # 'serial' | 'can'
+```
+
+Features missing on a protocol raise `KeyaUnsupportedError` (subclass of `KeyaError`).
+Over CAN: no digital-output writes, no `read_motor_power`, `read_closed_loop_error`,
+`read_feedback`, `is_locked`, analog/pulse inputs, `read_internal_serial_command`;
+`read_all_digital_inputs` is unavailable (`read_digital_input(pin)` works).
+
+Modules: `keya_motor.py` (public API), `keya_transport.py` (interface + errors),
+`keya_serial.py` (RS232), `keya_can.py` (CANopen SDO, needs `python-can`).
+
+### CAN setup
+
+- Protocol: `datasheets/kydbl4850-1e/CAN protocol.pdf`. Controller default: node ID 1, 250 kbit/s.
+- CAN and USB cannot run together on most models; configure via the RS232/USB utility first.
+- Bring the interface up before use: `sudo ip link set can0 up type can bitrate 250000`
+- `pip install python-can`. Wire 120 Ω terminators at both ends of the bus.
+
+## RS232
 
 - Serial settings: 115200 baud, 8-N-1
 - Commands are ASCII, terminated with carriage return (`\r`)
