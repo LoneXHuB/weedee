@@ -260,28 +260,34 @@ class SerialTransport(Transport):
             desc = self._describe_tx(command)
             print(f"  TX  {command:<22}  {desc}")
 
-        # The controller echoes the command before sending the actual response.
-        # Read lines until we get something that isn't our own echo.
-        for _ in range(4):
+        # The controller echoes the command, then sends the real reply.  Motor
+        # noise can also inject corrupted bytes.  A *real* reply is exactly '+',
+        # exactly '-', or contains '=' (KEY=value).  Anything else (the echo or
+        # a garbled noise byte) is skipped so transient corruption can't raise.
+        for _ in range(8):
             raw = self._serial.read_until(b'\r')
             response = raw.decode('ascii', errors='replace').strip()
 
+            is_real = response in ('+', '-') or '=' in response
+
             if self.debug:
-                if response.upper() == command.upper():
-                    print(f"  RX  {response:<22}  [echo]")
+                if not response:
+                    pass  # timeout / empty read
+                elif not is_real:
+                    print(f"  RX  {response:<22}  [echo/noise — skipped]")
                 else:
                     desc = self._describe_rx(response, command)
                     print(f"  RX  {response:<22}  {desc}")
 
-            if response.upper() == command.upper():
-                continue  # echo — read the real response
+            if not is_real:
+                continue  # echo or noise — keep reading for the real reply
 
             if response == '-':
                 raise _Rejected(f"Controller rejected command: {command!r}")
 
             return response
 
-        raise KeyaError(f"No response after echo for command: {command!r}")
+        raise KeyaError(f"No valid response for command: {command!r}")
 
     # -- Transport interface ---------------------------------------------
 
@@ -289,8 +295,24 @@ class SerialTransport(Transport):
     def _format(cls, prefix: str, cmd: str, args) -> str:
         return ' '.join([prefix + cmd] + [str(a) for a in args])
 
-    def write(self, cmd: str, *args: int) -> None:
+    def _send_fast(self, command: str) -> None:
+        """
+        Fire-and-forget: write without reading the reply, so RS232 noise can
+        never raise.  The stale echo/ack is flushed by the next call's
+        reset_input_buffer().
+        """
+        if not self.is_open:
+            raise KeyaError("Not connected — call connect() first.")
+        self._serial.reset_input_buffer()
+        self._serial.write((command + '\r').encode('ascii'))
+        if self.debug:
+            print(f"  TX  {command:<22}  {self._describe_tx(command)} [fast]")
+
+    def write(self, cmd: str, *args: int, verify: bool = True) -> None:
         command = self._format(self._PREFIX.get(cmd, '!'), cmd, args)
+        if not verify:
+            self._send_fast(command)
+            return
         resp = self._send(command)
         if resp and resp != '+':
             raise KeyaError(

@@ -38,7 +38,9 @@ class Transport:
     def is_open(self) -> bool:
         raise NotImplementedError
 
-    def write(self, cmd: str, *args: int) -> None:
+    def write(self, cmd: str, *args: int, verify: bool = True) -> None:
+        """Send a command.  verify=False: fire-and-forget, do not read the reply
+        (for high-rate live control; link noise then cannot raise)."""
         raise NotImplementedError
 
     def query(self, cmd: str, *args: int) -> List[int]:

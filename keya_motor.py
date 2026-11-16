@@ -180,8 +180,8 @@ class KeyaMotorController:
     # Protocol-neutral helpers
     # ------------------------------------------------------------------
 
-    def _write(self, cmd: str, *args: int) -> None:
-        self._transport.write(cmd, *args)
+    def _write(self, cmd: str, *args: int, verify: bool = True) -> None:
+        self._transport.write(cmd, *args, verify=verify)
 
     def _query(self, cmd: str, *args: int) -> List[int]:
         return self._transport.query(cmd, *args)
@@ -204,6 +204,7 @@ class KeyaMotorController:
         self,
         channel1: int,
         channel2: Optional[int] = None,
+        verify: bool = True,
     ) -> None:
         """
         Set motor speed.
@@ -213,6 +214,9 @@ class KeyaMotorController:
                       Positive = forward, negative = reverse.
             channel2: Speed for channel 2 (dual-channel controllers only).
                       Omit for single-channel controllers.
+            verify:   When True (default), wait for and check the acknowledgment.
+                      When False, fire-and-forget — the reply is not read, so
+                      link noise can't raise.  Use for high-rate live control.
 
         Raises:
             ValueError: Speed out of -1000..+1000 range.
@@ -226,9 +230,9 @@ class KeyaMotorController:
         if channel2 is not None:
             if not -1000 <= channel2 <= 1000:
                 raise ValueError(f"channel2 speed {channel2} out of range -1000..1000")
-            self._write('M', channel1, channel2)
+            self._write('M', channel1, channel2, verify=verify)
         else:
-            self._write('M', channel1)
+            self._write('M', channel1, verify=verify)
 
     def stop(self, channel: Optional[int] = None) -> None:
         """

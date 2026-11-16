@@ -115,8 +115,11 @@ class CanTransport(Transport):
         if self.debug:
             print(f"  {tag}  0x{can_id:03X}  {' '.join(f'{b:02X}' for b in data)}")
 
-    def _transfer(self, data: bytes) -> bytes:
-        """Send one SDO request frame and return the matching response data."""
+    def _transfer(self, data: bytes, wait: bool = True) -> bytes:
+        """Send one SDO request frame and return the matching response data.
+
+        wait=False: do not read the reply (fire-and-forget); returns b''.  The
+        late reply is dropped as a stale frame by the next transfer."""
         import can
         if self._bus is None:
             raise KeyaError("Not connected — call connect() first.")
@@ -129,6 +132,8 @@ class CanTransport(Transport):
             self._log('TX', req_id, data)
             self._bus.send(can.Message(arbitration_id=req_id, data=data,
                                        is_extended_id=False))
+            if not wait:
+                return b''
             deadline = time.monotonic() + self.timeout
             while True:
                 remaining = deadline - time.monotonic()
@@ -152,10 +157,12 @@ class CanTransport(Transport):
             )
         return resp
 
-    def _sdo_write(self, index: int, sub: int, value: int) -> None:
+    def _sdo_write(self, index: int, sub: int, value: int, wait: bool = True) -> None:
         data = bytes([0x23, index & 0xFF, index >> 8, sub]) + \
             value.to_bytes(4, 'little', signed=value < 0)
-        resp = self._transfer(data)
+        resp = self._transfer(data, wait)
+        if not wait:
+            return
         if resp[0] != 0x60:
             raise KeyaError(f"Unexpected SDO write reply: {resp.hex()}")
 
@@ -169,20 +176,20 @@ class CanTransport(Transport):
 
     # -- Transport interface ---------------------------------------------
 
-    def write(self, cmd: str, *args: int) -> None:
+    def write(self, cmd: str, *args: int, verify: bool = True) -> None:
         if cmd == 'M':                       # speed: one SDO per channel
             for channel, speed in enumerate(args, start=1):
-                self._sdo_write(_SPEED_INDEX, channel, speed)
+                self._sdo_write(_SPEED_INDEX, channel, speed, verify)
             return
         if cmd not in _WRITE:
             raise KeyaUnsupportedError(f"Command {cmd!r} is not available over CAN")
         index, per_channel = _WRITE[cmd]
         if not per_channel:
-            self._sdo_write(index, 0, 1)
+            self._sdo_write(index, 0, 1, verify)
         elif cmd == 'MS':
-            self._sdo_write(index, args[0], 1)
+            self._sdo_write(index, args[0], 1, verify)
         else:
-            self._sdo_write(index, args[0], args[1])
+            self._sdo_write(index, args[0], args[1], verify)
 
     def query(self, cmd: str, *args: int) -> List[int]:
         if cmd == 'DI':                      # derived from the inputs bitmask
