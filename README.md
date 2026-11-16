@@ -34,7 +34,7 @@ Modules: `keya_motor.py` (public API), `keya_transport.py` (interface + errors),
 
 ## Command reference (TX)
 
-Outgoing commands recognised by `_describe_tx`, grouped as in the source.
+Outgoing commands recognised by `SerialTransport._describe_tx` (`keya_serial.py`).
 
 ### Motor control
 
@@ -94,7 +94,7 @@ Outgoing commands recognised by `_describe_tx`, grouped as in the source.
 
 ## Response reference (RX)
 
-Incoming response keys (the part before `=`) recognised by `_describe_rx`.
+Incoming response keys (the part before `=`) recognised by `SerialTransport._describe_rx`.
 
 | Key         | Description                                        |
 | ----------- | --------------------------------------------------- |
